@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>闲鱼商品导出助手</title>
+  <style>
+    :root {
+      --bg: #f7f4ea;
+      --panel: #fffdf7;
+      --ink: #1f2a2e;
+      --accent: #165d59;
+      --muted: #627273;
+      --line: #d8d1be;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 500px at 0% -10%, #e8f2ea 0, transparent 60%),
+        radial-gradient(1200px 500px at 100% 110%, #f2e9d6 0, transparent 60%),
+        var(--bg);
+    }
+    .wrap { max-width: 980px; margin: 28px auto; padding: 0 16px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 18px;
+      box-shadow: 0 8px 28px rgba(26, 26, 26, .06);
+    }
+    h1 { margin: 0 0 14px; font-size: 26px; }
+    .grid {
+      display: grid;
+      grid-template-columns: 180px 1fr;
+      gap: 10px 12px;
+      align-items: center;
+    }
+    label { color: var(--muted); font-size: 14px; }
+    input, textarea {
+      width: 100%;
+      border: 1px solid #bfc8c8;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 14px;
+      background: #fff;
+      color: var(--ink);
+    }
+    textarea { min-height: 110px; resize: vertical; }
+    .row { margin-top: 12px; display: flex; gap: 10px; align-items: center; }
+    button {
+      border: 0;
+      border-radius: 10px;
+      background: var(--accent);
+      color: #fff;
+      padding: 10px 16px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .hint { color: var(--muted); font-size: 12px; }
+    .log {
+      margin-top: 14px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #101717;
+      color: #e4f8f5;
+      min-height: 260px;
+      max-height: 420px;
+      overflow: auto;
+      padding: 10px 12px;
+      white-space: pre-wrap;
+      font-family: Menlo, Monaco, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>闲鱼商品导出助手</h1>
+      <div class="grid">
+        <label for="personalUrl">个人主页 URL</label>
+        <input id="personalUrl" placeholder="https://www.goofish.com/personal?userId=..." />
+
+        <label for="outDir">导出目录（可空）</label>
+        <input id="outDir" placeholder="留空则自动生成：用户名_userid_时间_过滤条件" />
+
+        <label for="includeKeywords">包含关键词</label>
+        <input id="includeKeywords" placeholder="例如: toi,图益" />
+
+        <label for="excludeKeywords">排除关键词</label>
+        <input id="excludeKeywords" placeholder="例如: 周边,配件" />
+
+        <label for="maxItems">最大导出数</label>
+        <input id="maxItems" value="0" />
+
+        <label for="cookies">Cookies</label>
+        <textarea id="cookies" placeholder="粘贴完整 cookie 字符串"></textarea>
+      </div>
+      <div class="row">
+        <button id="startBtn">开始导出</button>
+        <span class="hint">说明：界面是本地 HTML，导出逻辑使用在线 URL + cookies；导出目录可留空自动生成。</span>
+      </div>
+      <div class="log" id="logBox"></div>
+    </div>
+  </div>
+
+  <script>
+    const logBox = document.getElementById("logBox");
+    const startBtn = document.getElementById("startBtn");
+
+    function log(msg) {
+      const now = new Date().toLocaleTimeString();
+      logBox.textContent += `[${now}] ${msg}\n`;
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    async function start() {
+      const payload = {
+        personal_url: document.getElementById("personalUrl").value.trim(),
+        out_dir: document.getElementById("outDir").value.trim(),
+        include_keywords: document.getElementById("includeKeywords").value.trim(),
+        exclude_keywords: document.getElementById("excludeKeywords").value.trim(),
+        max_items: document.getElementById("maxItems").value.trim() || "0",
+        cookies: document.getElementById("cookies").value.trim(),
+      };
+      if (!payload.personal_url || !payload.cookies) {
+        alert("personal_url / cookies 不能为空");
+        return;
+      }
+
+      startBtn.disabled = true;
+      logBox.textContent = "";
+      log("提交任务...");
+
+      const res = await fetch("/api/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        log(`启动失败: ${data.error || res.statusText}`);
+        startBtn.disabled = false;
+        return;
+      }
+
+      const taskId = data.task_id;
+      log(`任务已启动: ${taskId}`);
+      if (data.out_dir) {
+        log(`输出目录: ${data.out_dir}`);
+      }
+      let offset = 0;
+
+      while (true) {
+        await new Promise(r => setTimeout(r, 1200));
+        const sRes = await fetch(`/api/status/${taskId}?offset=${offset}`);
+        const sData = await sRes.json();
+        if (!sData.ok) {
+          log(`状态查询失败: ${sData.error}`);
+          break;
+        }
+        for (const line of sData.logs) log(line);
+        offset = sData.next_offset;
+
+        if (sData.status === "done") {
+          log(`完成: ${JSON.stringify(sData.summary)}`);
+          break;
+        }
+        if (sData.status === "error") {
+          log(`失败: ${sData.error}`);
+          break;
+        }
+      }
+
+      startBtn.disabled = false;
+    }
+
+    startBtn.addEventListener("click", () => {
+      start().catch(err => {
+        log(`异常: ${err}`);
+        startBtn.disabled = false;
+      });
+    });
+  </script>
+</body>
+</html>

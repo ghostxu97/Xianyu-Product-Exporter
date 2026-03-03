@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# secrets
+goofish_cookie.txt
+*.cookie
+
+# runtime logs
+*.log
+
+# export output folders (default naming)
+*_inc-*_exc-*/
+products_export*/
+toi_test_run/
+
+# local temp
+tmp/
