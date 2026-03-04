@@ -56,6 +56,7 @@ def api_start():
     include_raw = str(payload.get("include_keywords", "")).strip()
     exclude_raw = str(payload.get("exclude_keywords", "")).strip()
     max_items_raw = str(payload.get("max_items", "0")).strip()
+    include_offline_raw = payload.get("include_offline_items", True)
 
     if not personal_url:
         return jsonify({"ok": False, "error": "personal_url 不能为空"}), 400
@@ -68,6 +69,7 @@ def api_start():
 
     include_keywords = split_keywords(include_raw)
     exclude_keywords = split_keywords(exclude_raw)
+    include_offline_items = str(include_offline_raw).strip().lower() not in {"false", "0", "no", "off"}
     if not out_dir:
         out_dir = str(
             build_default_output_dir(
@@ -97,6 +99,7 @@ def api_start():
                 max_items=max_items,
                 include_keywords=include_keywords,
                 exclude_keywords=exclude_keywords,
+                include_offline_items=include_offline_items,
                 log=lambda msg: _append_log(task_id, msg),
             )
             _update_task(task_id, status="done", summary=summary, out_dir=out_dir)

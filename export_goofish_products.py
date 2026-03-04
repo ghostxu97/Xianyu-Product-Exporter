@@ -62,6 +62,98 @@ def match_filters(text: str, include: list[str], exclude: list[str]) -> bool:
     return True
 
 
+def detect_listing_status(*sources: dict | None) -> tuple[str, str, str]:
+    # 仅使用语义明确的字段，避免模糊字符串误判。
+    key_order = [
+        "itemStatus",
+        "item_status",
+        "onlineStatus",
+        "online_status",
+        "shelfStatus",
+        "shelf_status",
+        "onSale",
+        "onsale",
+        "isOnSale",
+        "is_on_sale",
+        "soldOut",
+        "sold_out",
+        "isOffline",
+        "is_offline",
+    ]
+    online_exact = {
+        "1",
+        "true",
+        "online",
+        "on_shelf",
+        "onshelf",
+        "on_sale",
+        "onsale",
+        "normal",
+        "active",
+        "available",
+        "上架",
+        "在售",
+        "出售中",
+    }
+    offline_exact = {
+        "0",
+        "false",
+        "offline",
+        "off_shelf",
+        "offshelf",
+        "off_sale",
+        "sold_out",
+        "soldout",
+        "end",
+        "ended",
+        "expired",
+        "invalid",
+        "deleted",
+        "下架",
+        "已下架",
+        "售罄",
+        "失效",
+    }
+
+    def normalize(v: object) -> str:
+        t = str(v).strip().lower()
+        t = re.sub(r"[\s\-]+", "_", t)
+        return t
+
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for key in key_order:
+            if key not in src:
+                continue
+            val = src.get(key)
+            raw = "" if val is None else str(val).strip()
+            if val is None or raw == "":
+                continue
+
+            token = normalize(val)
+            key_low = key.lower()
+
+            # 布尔/0-1 语义字段，按 key 方向解释
+            if key_low in {"onsale", "on_sale", "isonsale", "is_on_sale", "onsale"}:
+                if token in {"1", "true"}:
+                    return "上架", raw, key
+                if token in {"0", "false"}:
+                    return "下架", raw, key
+            if key_low in {"soldout", "sold_out", "isoffline", "is_offline"}:
+                if token in {"1", "true"}:
+                    return "下架", raw, key
+                if token in {"0", "false"}:
+                    return "上架", raw, key
+
+            if token in online_exact:
+                return "上架", raw, key
+            if token in offline_exact:
+                return "下架", raw, key
+
+    return "未知", "", ""
+
+
 def cookie_token(cookie: str) -> str:
     m = re.search(r"(?:^|;\s*)_m_h5_tk=([^;]+)", cookie)
     if not m:
@@ -203,13 +295,37 @@ def build_default_output_dir(
     return (base_dir / folder_name).resolve()
 
 
-def fetch_user_items(
-    session: requests.Session, cookie: str, personal_url: str, log: LogFn | None = None
-) -> list[dict]:
-    user_id = user_id_from_personal_url(personal_url)
-    if not user_id:
-        raise RuntimeError("personal-url 中缺少 userId 参数。")
+def _extract_item_from_card(card: dict, listing_status: str = "未知") -> dict | None:
+    card_data = card.get("cardData") or {}
+    detail_params = card_data.get("detailParams") or {}
+    item_id = str(detail_params.get("itemId") or "").strip()
+    if not item_id:
+        return None
+    title = str(card_data.get("title") or detail_params.get("title") or "").strip()
+    current_price = str(
+        (card_data.get("priceInfo") or {}).get("price") or detail_params.get("soldPrice") or ""
+    ).strip()
+    status_raw = str(card_data.get("itemStatus") or "").strip()
+    return {
+        "item_id": item_id,
+        "title": title,
+        "current_price": current_price,
+        "item_url": f"https://www.goofish.com/item?id={item_id}",
+        "listing_status": listing_status,
+        "listing_status_raw": status_raw,
+        "listing_status_key": "itemGroupList/groupName",
+    }
 
+
+def _fetch_items_by_group(
+    session: requests.Session,
+    cookie: str,
+    personal_url: str,
+    user_id: str,
+    group: dict,
+    listing_status: str,
+    log: LogFn | None = None,
+) -> list[dict]:
     all_items: list[dict] = []
     page_number = 1
     next_page_model = None
@@ -217,11 +333,18 @@ def fetch_user_items(
 
     while True:
         data_obj = {
-            "needGroupInfo": page_number == 1,
+            "needGroupInfo": False,
             "pageNumber": page_number,
             "userId": user_id,
             "pageSize": 20,
+            "groupId": group.get("groupId"),
+            "groupName": group.get("groupName"),
+            "defaultGroup": bool(group.get("defaultGroup", True)),
         }
+        if group.get("groupSortId") is not None:
+            data_obj["groupSortId"] = group.get("groupSortId")
+        if group.get("filterPanelGroupId") is not None:
+            data_obj["filterPanelGroupId"] = group.get("filterPanelGroupId")
         if next_page_model:
             data_obj["nextPageModel"] = next_page_model
         if next_page_num:
@@ -239,32 +362,138 @@ def fetch_user_items(
         except RuntimeError as e:
             msg = str(e)
             if "FAIL_BIZ_FORBIDDEN" in msg:
-                _log(log, f"分页触发平台上限，停止继续翻页。当前已抓取 {len(all_items)} 条商品候选。")
+                _log(
+                    log,
+                    f"分组 {group.get('groupName')} 触发平台分页上限，停止继续翻页。当前已抓取 {len(all_items)} 条。",
+                )
                 break
             raise
 
         for card in data.get("cardList") or []:
-            card_data = card.get("cardData") or {}
-            detail_params = card_data.get("detailParams") or {}
-            item_id = str(detail_params.get("itemId") or "").strip()
-            if not item_id:
-                continue
-            title = str(card_data.get("title") or detail_params.get("title") or "").strip()
-            current_price = str((card_data.get("priceInfo") or {}).get("price") or detail_params.get("soldPrice") or "").strip()
-            all_items.append(
-                {
-                    "item_id": item_id,
-                    "title": title,
-                    "current_price": current_price,
-                    "item_url": f"https://www.goofish.com/item?id={item_id}",
-                }
-            )
+            item = _extract_item_from_card(card, listing_status=listing_status)
+            if item:
+                all_items.append(item)
 
         if not data.get("nextPage"):
             break
         page_number += 1
         next_page_model = data.get("nextPageModel")
         next_page_num = data.get("nextPageNum")
+
+    return all_items
+
+
+def fetch_user_items(
+    session: requests.Session,
+    cookie: str,
+    personal_url: str,
+    include_offline_items: bool = True,
+    log: LogFn | None = None,
+) -> list[dict]:
+    user_id = user_id_from_personal_url(personal_url)
+    if not user_id:
+        raise RuntimeError("personal-url 中缺少 userId 参数。")
+
+    all_items: list[dict] = []
+
+    # 首次请求：拿分组信息（与页面“在售/已售出”筛选一致）
+    first_data = request_mtop(
+        session=session,
+        cookie=cookie,
+        api="mtop.idle.web.xyh.item.list",
+        data_obj={"needGroupInfo": True, "pageNumber": 1, "userId": user_id, "pageSize": 20},
+        referer=personal_url,
+        v="1.0",
+    )
+    groups = first_data.get("itemGroupList") or []
+    sale_group = None
+    sold_group = None
+    for g in groups:
+        name = str((g or {}).get("groupName") or "").strip()
+        if not sale_group and ("在售" in name or name == "出售中"):
+            sale_group = g
+        if not sold_group and ("已售" in name or "售出" in name):
+            sold_group = g
+
+    if sale_group:
+        _log(log, f"命中分组筛选：在售(groupId={sale_group.get('groupId')})")
+        all_items.extend(
+            _fetch_items_by_group(
+                session=session,
+                cookie=cookie,
+                personal_url=personal_url,
+                user_id=user_id,
+                group=sale_group,
+                listing_status="上架",
+                log=log,
+            )
+        )
+    if include_offline_items and sold_group:
+        _log(log, f"命中分组筛选：已售出(groupId={sold_group.get('groupId')})")
+        all_items.extend(
+            _fetch_items_by_group(
+                session=session,
+                cookie=cookie,
+                personal_url=personal_url,
+                user_id=user_id,
+                group=sold_group,
+                listing_status="下架",
+                log=log,
+            )
+        )
+
+    # 若分组信息缺失，回退到旧逻辑（尽量不中断）
+    if not all_items:
+        _log(log, "未获取到在售/已售出分组，回退到默认分页并使用字段识别状态。")
+        page_number = 1
+        next_page_model = None
+        next_page_num = None
+        while True:
+            data_obj = {
+                "needGroupInfo": page_number == 1,
+                "pageNumber": page_number,
+                "userId": user_id,
+                "pageSize": 20,
+            }
+            if next_page_model:
+                data_obj["nextPageModel"] = next_page_model
+            if next_page_num:
+                data_obj["nextPageNum"] = next_page_num
+
+            try:
+                data = request_mtop(
+                    session=session,
+                    cookie=cookie,
+                    api="mtop.idle.web.xyh.item.list",
+                    data_obj=data_obj,
+                    referer=personal_url,
+                    v="1.0",
+                )
+            except RuntimeError as e:
+                msg = str(e)
+                if "FAIL_BIZ_FORBIDDEN" in msg:
+                    _log(log, f"分页触发平台上限，停止继续翻页。当前已抓取 {len(all_items)} 条商品候选。")
+                    break
+                raise
+
+            for card in data.get("cardList") or []:
+                item = _extract_item_from_card(card, listing_status="未知")
+                if not item:
+                    continue
+                # 回退逻辑下，继续尝试从字段推断
+                card_data = card.get("cardData") or {}
+                detail_params = card_data.get("detailParams") or {}
+                st, raw, key = detect_listing_status(card_data, detail_params)
+                item["listing_status"] = st
+                item["listing_status_raw"] = raw
+                item["listing_status_key"] = key
+                all_items.append(item)
+
+            if not data.get("nextPage"):
+                break
+            page_number += 1
+            next_page_model = data.get("nextPageModel")
+            next_page_num = data.get("nextPageNum")
 
     # de-dup keep first
     seen: set[str] = set()
@@ -322,6 +551,7 @@ def export_products(
     max_items: int = 0,
     include_keywords: list[str] | None = None,
     exclude_keywords: list[str] | None = None,
+    include_offline_items: bool = True,
     log: LogFn | None = None,
 ) -> dict:
     include_keywords = include_keywords or []
@@ -338,6 +568,7 @@ def export_products(
     exported = 0
     saved_image_count = 0
     skipped_by_filter = 0
+    skipped_offline = 0
     detail_fail_count = 0
     session = requests.Session()
 
@@ -370,6 +601,9 @@ def export_products(
 
         description = title
         image_urls: list[str] = []
+        listing_status = "未知"
+        listing_status_raw = ""
+        listing_status_key = ""
 
         if cookie:
             try:
@@ -384,11 +618,16 @@ def export_products(
                         u = to_abs_image_url(str(image_info.get("url") or ""))
                         if u:
                             image_urls.append(u)
+                listing_status, listing_status_raw, listing_status_key = detect_listing_status(item, detail)
             except Exception as e:
                 detail_fail_count += 1
                 fail_log.open("a", encoding="utf-8").write(
                     f"{item_id}\t{href}\t{type(e).__name__}: {e}\n"
                 )
+
+        if (not include_offline_items) and listing_status == "下架":
+            skipped_offline += 1
+            continue
 
         filter_text = f"{title}\n{description}"
         if not match_filters(filter_text, include_keywords, exclude_keywords):
@@ -443,6 +682,9 @@ def export_products(
             "description": description,
             "current_price": current_price,
             "original_price": original_price,
+            "listing_status": listing_status,
+            "listing_status_raw": listing_status_raw,
+            "listing_status_key": listing_status_key,
             "item_url": href,
             "images_source": image_urls,
             "images_local": local_images,
@@ -457,6 +699,9 @@ def export_products(
                     f"商品介绍: {description}",
                     f"商品现价: {current_price}",
                     f"商品原价: {original_price}",
+                    f"商品状态: {listing_status}",
+                    f"状态字段: {listing_status_key or '-'}",
+                    f"状态原值: {listing_status_raw or '-'}",
                     f"商品链接: {href}",
                     "商品图片(源):",
                     *[f"  - {u}" for u in image_urls],
@@ -477,12 +722,13 @@ def export_products(
         "images_saved": saved_image_count,
         "candidates": total,
         "skipped_by_filter": skipped_by_filter,
+        "skipped_offline": skipped_offline,
         "detail_fail_count": detail_fail_count,
     }
     _log(
         log,
         f"导出完成: {exported} 个商品文件夹, 共保存 {saved_image_count} 张图片, "
-        f"过滤跳过 {skipped_by_filter} 个。",
+        f"过滤跳过 {skipped_by_filter} 个, 下架跳过 {skipped_offline} 个。",
     )
     return summary
 
@@ -494,6 +740,7 @@ def export_from_online(
     max_items: int = 0,
     include_keywords: list[str] | None = None,
     exclude_keywords: list[str] | None = None,
+    include_offline_items: bool = True,
     log: LogFn | None = None,
 ) -> dict:
     if not personal_url.strip():
@@ -515,13 +762,20 @@ def export_from_online(
         _log(log, f"主页HTML获取失败(不中断): {type(e).__name__}: {e}")
 
     session = requests.Session()
-    items = fetch_user_items(session, cookie, personal_url, log=log)
+    items = fetch_user_items(
+        session,
+        cookie,
+        personal_url,
+        include_offline_items=include_offline_items,
+        log=log,
+    )
     total = len(items)
     _log(log, f"在线商品候选数: {total}")
 
     exported = 0
     saved_image_count = 0
     skipped_by_filter = 0
+    skipped_offline = 0
     detail_fail_count = 0
     filtered_items: list[dict] = []
 
@@ -534,6 +788,9 @@ def export_from_online(
         original_price = ""
         item_url = base.get("item_url", f"https://www.goofish.com/item?id={item_id}")
         image_urls: list[str] = []
+        listing_status = str(base.get("listing_status") or "未知")
+        listing_status_raw = str(base.get("listing_status_raw") or "").strip()
+        listing_status_key = str(base.get("listing_status_key") or "").strip()
 
         try:
             detail = request_detail(session, cookie, item_id)
@@ -547,6 +804,17 @@ def export_from_online(
                     u = to_abs_image_url(str(image_info.get("url") or ""))
                     if u:
                         image_urls.append(u)
+            detected_status, detected_raw, detected_key = detect_listing_status(item, detail)
+            # 若状态来自页面分组筛选（在售/已售出），优先使用分组状态，不被详情字段覆盖。
+            if listing_status_key == "itemGroupList/groupName" and listing_status in {"上架", "下架"}:
+                if not listing_status_raw:
+                    listing_status_raw = detected_raw
+            else:
+                listing_status, listing_status_raw, listing_status_key = (
+                    detected_status,
+                    detected_raw,
+                    detected_key,
+                )
         except Exception as e:
             detail_fail_count += 1
             fail_log.open("a", encoding="utf-8").write(
@@ -554,12 +822,17 @@ def export_from_online(
             )
 
         display_name = title or item_id
+        if (not include_offline_items) and listing_status == "下架":
+            skipped_offline += 1
+            _log(log, f"{idx}/{total} 跳过下架：{display_name}")
+            continue
+
         if not match_filters(f"{title}\n{description}", include_keywords, exclude_keywords):
             skipped_by_filter += 1
             _log(log, f"{idx}/{total} 跳过：{display_name}")
             continue
 
-        _log(log, f"{idx}/{total} 命中：{display_name}")
+        _log(log, f"{idx}/{total} 命中({listing_status})：{display_name}")
         filtered_items.append(
             {
                 "item_id": item_id,
@@ -567,6 +840,9 @@ def export_from_online(
                 "description": description,
                 "current_price": current_price,
                 "original_price": original_price,
+                "listing_status": listing_status,
+                "listing_status_raw": listing_status_raw,
+                "listing_status_key": listing_status_key,
                 "item_url": item_url,
                 "image_urls": image_urls,
             }
@@ -585,6 +861,9 @@ def export_from_online(
         description = info["description"]
         current_price = info["current_price"]
         original_price = info["original_price"]
+        listing_status = info.get("listing_status", "未知")
+        listing_status_raw = info.get("listing_status_raw", "")
+        listing_status_key = info.get("listing_status_key", "")
         item_url = info["item_url"]
         image_urls = info["image_urls"]
 
@@ -609,6 +888,9 @@ def export_from_online(
             "description": description,
             "current_price": current_price,
             "original_price": original_price,
+            "listing_status": listing_status,
+            "listing_status_raw": listing_status_raw,
+            "listing_status_key": listing_status_key,
             "item_url": item_url,
             "images_source": image_urls,
             "images_local": local_images,
@@ -623,6 +905,9 @@ def export_from_online(
                     f"商品介绍: {description}",
                     f"商品现价: {current_price}",
                     f"商品原价: {original_price}",
+                    f"商品状态: {listing_status}",
+                    f"状态字段: {listing_status_key or '-'}",
+                    f"状态原值: {listing_status_raw or '-'}",
                     f"商品链接: {item_url}",
                     "商品图片(源):",
                     *[f"  - {u}" for u in image_urls],
@@ -643,12 +928,13 @@ def export_from_online(
         "candidates": total,
         "filtered_total": filtered_total,
         "skipped_by_filter": skipped_by_filter,
+        "skipped_offline": skipped_offline,
         "detail_fail_count": detail_fail_count,
     }
     _log(
         log,
         f"导出完成: {exported} 个商品文件夹, 共保存 {saved_image_count} 张图片, "
-        f"过滤跳过 {skipped_by_filter} 个。",
+        f"过滤跳过 {skipped_by_filter} 个, 下架跳过 {skipped_offline} 个。",
     )
     return summary
 
@@ -663,6 +949,12 @@ def main() -> None:
     parser.add_argument("--cookie-file", default="", help="cookies 文件路径。")
     parser.add_argument("--include-keywords", default="", help="包含关键词过滤，逗号分隔。")
     parser.add_argument("--exclude-keywords", default="", help="排除关键词过滤，逗号分隔。")
+    parser.add_argument(
+        "--include-offline-items",
+        choices=["true", "false"],
+        default="true",
+        help="是否导出已下架商品：true/false，默认 true。",
+    )
     parser.add_argument("--max-items", type=int, default=0, help="调试用，只导出前 N 个；0 表示不限制。")
     args = parser.parse_args()
 
@@ -674,6 +966,7 @@ def main() -> None:
 
     include_keywords = split_keywords(args.include_keywords)
     exclude_keywords = split_keywords(args.exclude_keywords)
+    include_offline_items = args.include_offline_items.lower() == "true"
 
     out_dir = Path(args.out).resolve() if args.out.strip() else build_default_output_dir(
         personal_url=args.personal_url.strip(),
@@ -690,6 +983,7 @@ def main() -> None:
         max_items=args.max_items,
         include_keywords=include_keywords,
         exclude_keywords=exclude_keywords,
+        include_offline_items=include_offline_items,
     )
 
 

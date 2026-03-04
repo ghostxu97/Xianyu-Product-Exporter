@@ -49,6 +49,8 @@
       color: var(--ink);
     }
     textarea { min-height: 110px; resize: vertical; }
+    .check-wrap { display: flex; align-items: center; gap: 8px; }
+    .check-wrap input[type="checkbox"] { width: auto; transform: scale(1.05); }
     .row { margin-top: 12px; display: flex; gap: 10px; align-items: center; }
     button {
       border: 0;
@@ -98,6 +100,12 @@
         <label for="maxItems">最大导出数</label>
         <input id="maxItems" value="0" />
 
+        <label for="includeOfflineItems">导出已下架商品</label>
+        <div class="check-wrap">
+          <input id="includeOfflineItems" type="checkbox" checked />
+          <span class="hint">勾选=导出下架商品；不勾选=自动跳过下架商品</span>
+        </div>
+
         <label for="cookies">Cookies</label>
         <textarea id="cookies" placeholder="粘贴完整 cookie 字符串"></textarea>
       </div>
@@ -126,6 +134,7 @@
         include_keywords: document.getElementById("includeKeywords").value.trim(),
         exclude_keywords: document.getElementById("excludeKeywords").value.trim(),
         max_items: document.getElementById("maxItems").value.trim() || "0",
+        include_offline_items: document.getElementById("includeOfflineItems").checked,
         cookies: document.getElementById("cookies").value.trim(),
       };
       if (!payload.personal_url || !payload.cookies) {
